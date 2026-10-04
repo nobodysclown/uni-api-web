@@ -1,0 +1,277 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestSubInstalledChannelsManagementUsesLiveOwnedBindings(t *testing.T) {
+	dsn := os.Getenv("TEST_CONTROL_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("PostgreSQL required")
+	}
+	store, e := newControlStore(dsn, strings.Repeat("m", 32))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer store.Close()
+	owner := "management-" + randomID()[:8]
+	account := "sub_" + randomID()[:16]
+	source := "source-" + randomID()[:8]
+	key := "key-" + strings.Repeat("b", 64)
+	other := "key-" + strings.Repeat("c", 64)
+	defer store.db.Exec(`DELETE FROM console_sub_accounts WHERE id=$1`, account)
+	defer store.db.Exec(`DELETE FROM console_sources WHERE id=$1`, source)
+	routeSecret, _ := store.encrypt("routing-secret")
+	auth, _ := store.encrypt(`{"access_token":"panel-secret"}`)
+	_, e = store.db.Exec(`INSERT INTO console_sub_accounts(id,owner,name,base,email,encrypted_auth) VALUES($1,$2,'My Site','https://example.com','test@example.com',$3)`, account, owner, auth)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, e = store.db.Exec(`INSERT INTO console_sub_targets(account_id,group_id,name,platform,billing,encrypted_routing_key) VALUES($1,7,'Group','openai','{"rate":0.18}',$2)`, account, routeSecret)
+	if e != nil {
+		t.Fatal(e)
+	}
+	provider := subProviderName(account, 7, key)
+	otherProvider := subProviderName(account, 7, other)
+	// A second group was inserted at position 1 on the same caller key,
+	// shifting the first group down. Deleting the first must preserve this one.
+	_, e = store.db.Exec(`INSERT INTO console_sub_targets(account_id,group_id,name,platform,encrypted_routing_key) VALUES($1,8,'Second group','openai',$2)`, account, routeSecret)
+	if e != nil {
+		t.Fatal(e)
+	}
+	newFirst := subProviderName(account, 8, key)
+	order := []string{newFirst, provider, "existing"}
+	revision := "boot:1"
+	models := []string{checkModel, "gpt-5.6-sol"}
+	deleted := false
+	writes := 0
+	var last map[string]any
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer admin-secret" {
+			t.Error("wrong admin auth")
+		}
+		switch r.URL.Path {
+		case "/v1/api-keys":
+			writeJSON(w, 200, map[string]any{"data": []any{map[string]any{"key_id": key, "prefix": "masked-one", "position": 1}, map[string]any{"key_id": other, "prefix": "masked-two", "position": 2}}})
+		case "/v1/model-channels":
+			catalog := []batchCatalogRow{}
+			if !deleted {
+				for _, model := range models {
+					catalog = append(catalog, batchCatalogRow{Provider: provider, Model: model, Upstream: model})
+				}
+			}
+			writeJSON(w, 200, map[string]any{"data": catalog})
+		case "/v1/channel-controls":
+			temporary := []any{map[string]any{"provider": otherProvider, "api_key_id": other, "models": []string{checkModel}}, map[string]any{"provider": newFirst, "api_key_id": key, "models": []string{checkModel}}}
+			if !deleted {
+				temporary = append(temporary, map[string]any{"provider": provider, "api_key_id": key, "models": models})
+			}
+			writeJSON(w, 200, map[string]any{"instance_id": "boot", "revision": revision, "temporary_channel_management": true, "temporary_channels": temporary, "rules": []any{map[string]any{"api_key_id": key, "model": checkModel, "order": order}}})
+		case "/v1/temporary-channels":
+			last = nil
+			json.NewDecoder(r.Body).Decode(&last)
+			// Match the Rust gateway's Vec<String> decoding: absent defaults
+			// to [], but null is rejected before the action can run.
+			if models, present := last["models"]; present {
+				if _, ok := models.([]any); !ok {
+					http.Error(w, "invalid type: null, expected a sequence", 400)
+					return
+				}
+			}
+			if last["revision"] != revision {
+				http.Error(w, "conflict", 409)
+				return
+			}
+			writes++
+			if last["action"] == "delete" {
+				deleted = true
+				order = []string{newFirst, "existing"}
+			} else {
+				raw, _ := json.Marshal(last["models"])
+				json.Unmarshal(raw, &models)
+				order = []string{provider, newFirst, "existing"}
+			}
+			revision = "boot:" + string(rune('1'+writes))
+			writeJSON(w, 200, map[string]any{"instance_id": "boot", "revision": revision})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer gateway.Close()
+	if _, e = store.saveSource(context.Background(), controlSource{sourceView: sourceView{ID: source, Name: "Gateway", Base: gateway.URL}, Key: "admin-secret"}, false); e != nil {
+		t.Fatal(e)
+	}
+	s := &Service{control: store}
+	session, _ := store.newSession(context.Background(), owner)
+	foreign, _ := store.newSession(context.Background(), owner+"-foreign")
+	request := func(method, cookie string, body any) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(body)
+		r := httptest.NewRequest(method, "/v1/sub2api/channels", strings.NewReader(string(raw)))
+		r.Header.Set("Content-Type", "application/json")
+		if cookie != "" {
+			r.AddCookie(&http.Cookie{Name: "uni_console_session", Value: cookie})
+		}
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		return w
+	}
+	if w := request("GET", "", nil); w.Code != 401 {
+		t.Fatal("anonymous allowed", w.Code)
+	}
+	w := request("GET", session, nil)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var listing struct {
+		Data        []subInstalledChannel          `json:"data"`
+		Labels      map[string]map[string]string   `json:"labels"`
+		Multipliers map[string]map[string]*float64 `json:"multipliers"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &listing)
+	if len(listing.Data) != 3 || listing.Labels[source][provider] != "My Site-0.18" {
+		t.Fatal("missing live association", w.Body.String())
+	}
+	if listing.Multipliers[source][provider] == nil || *listing.Multipliers[source][provider] != .18 || listing.Multipliers[source][newFirst] != nil {
+		t.Fatal("billing multipliers missing or unknown rate fabricated")
+	}
+	for _, v := range listing.Data {
+		if v.Provider == provider && (v.Positions[checkModel] != 2 || v.KeyPrefix != "masked-one" || !v.Manageable) {
+			t.Fatal("wrong key/position", v)
+		}
+	}
+	if strings.Contains(w.Body.String(), "secret") {
+		t.Fatal("credentials exposed")
+	}
+	w = request("GET", foreign, nil)
+	json.Unmarshal(w.Body.Bytes(), &listing)
+	if len(listing.Data) != 0 {
+		t.Fatal("foreign owner bindings exposed")
+	}
+	readInfo := func(cookie, reveal string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "/v1/sources/"+source+"/channel-info?provider="+provider+"&reveal="+reveal, nil)
+		if cookie != "" {
+			r.AddCookie(&http.Cookie{Name: "uni_console_session", Value: cookie})
+		}
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		return w
+	}
+	if w := readInfo("", "true"); w.Code != 401 {
+		t.Fatal("anonymous secret read", w.Code)
+	}
+	if w := readInfo(foreign, "true"); w.Code != 404 {
+		t.Fatal("foreign secret read", w.Code)
+	}
+	if w := readInfo(session, "false"); w.Code != 200 || strings.Contains(w.Body.String(), "routing-secret") || !strings.Contains(w.Body.String(), "https://example.com/dashboard") {
+		t.Fatal("unrequested key exposed or bad URL", w.Code)
+	}
+	if w := readInfo(session, "true"); w.Code != 200 || !strings.Contains(w.Body.String(), "routing-secret") || strings.Contains(w.Body.String(), "panel-secret") || w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("wrong scoped credential", w.Code)
+	}
+	in := subImportInput{Action: "replace", AccountID: account, GroupID: 7, SourceID: source, KeyID: key, Revision: "boot:1", Models: []string{checkModel}, Position: 1}
+	if w = request("PATCH", foreign, in); w.Code != 404 {
+		t.Fatal("foreign mutation allowed", w.Code)
+	}
+	in.Models = []string{"gpt-5.5"}
+	if w = request("PATCH", session, in); w.Code != 400 {
+		t.Fatal("untested new model allowed", w.Code)
+	}
+	in.Models = []string{checkModel}
+	if w = request("PATCH", session, in); w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var savedRevision struct {
+		Revision string `json:"revision"`
+	}
+	if json.Unmarshal(w.Body.Bytes(), &savedRevision) != nil || savedRevision.Revision != revision {
+		t.Fatal("missing exact applied revision", w.Body.String())
+	}
+	if len(models) != 1 || last["provider"] != provider || last["action"] != "replace" {
+		t.Fatal("wrong replacement", last)
+	}
+	if w = request("PATCH", session, in); w.Code != 409 {
+		t.Fatal("stale edit accepted", w.Code)
+	}
+	if writes != 1 {
+		t.Fatal("rejected request mutated gateway", writes)
+	}
+	// Old clients cannot bypass availability validation with the former override.
+	in.Revision = revision
+	in.AllowUnverifiedModels = true
+	in.Models = []string{checkModel, "gpt-6-sol"}
+	if w = request("PATCH", foreign, in); w.Code != 404 {
+		t.Fatal("explicit edit bypassed owner", w.Code)
+	}
+	if w = request("PATCH", session, in); w.Code != 400 || writes != 1 {
+		t.Fatal("untested explicit selection changed routes", w.Code, w.Body.String())
+	}
+	_, e = store.db.Exec(`INSERT INTO console_sub_models(account_id,group_id,model,state,result) VALUES($1,7,'gpt-6-sol','done',$2)`, account, mustJSON(subResult{Model: "gpt-6-sol", Availability: subProbe{Status: "error"}}))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if w = request("PATCH", session, in); w.Code != 400 || writes != 1 {
+		t.Fatal("failed model changed routes", w.Code, w.Body.String())
+	}
+	_, e = store.db.Exec(`UPDATE console_sub_models SET result=$2 WHERE account_id=$1 AND model='gpt-6-sol'`, account, mustJSON(subResult{Model: "gpt-6-sol", Availability: subProbe{Status: "success"}}))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if w = request("PATCH", session, in); w.Code != 200 {
+		t.Fatal("verified extra model rejected", w.Code, w.Body.String())
+	}
+	if len(models) != 2 || writes != 2 {
+		t.Fatal("manual model was not saved", models, writes)
+	}
+	in.Revision = revision
+	in.Models = []string{"bad\nmodel"}
+	if w = request("PATCH", session, in); w.Code != 400 || writes != 2 {
+		t.Fatal("invalid explicit model changed config", w.Code)
+	}
+	in.Action = "delete"
+	in.Revision = revision
+	in.Models = nil
+	if w = request("PATCH", session, in); w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if json.Unmarshal(w.Body.Bytes(), &savedRevision) != nil || savedRevision.Revision != revision {
+		t.Fatal("missing deletion revision", w.Body.String())
+	}
+	if _, ok := last["models"]; ok {
+		t.Fatal("delete must not send replacement models")
+	}
+	if _, ok := last["position"]; ok {
+		t.Fatal("delete must not send a position")
+	}
+	if w := readInfo(session, "true"); w.Code != 404 {
+		t.Fatal("deleted channel still exposes credential", w.Code)
+	}
+	w = request("GET", session, nil)
+	json.Unmarshal(w.Body.Bytes(), &listing)
+	if len(listing.Data) != 2 {
+		t.Fatal("other binding lost", w.Body.String())
+	}
+	for _, item := range listing.Data {
+		if item.Provider == newFirst && (item.KeyID != key || item.Positions[checkModel] != 1) {
+			t.Fatal("the other group lost first priority", item)
+		}
+		if item.Provider != newFirst && item.Provider != otherProvider {
+			t.Fatal("wrong channel survived deletion", item.Provider)
+		}
+	}
+	if _, exists := listing.Labels[source][provider]; exists {
+		t.Fatal("deleted channel unnecessarily expanded label response")
+	}
+	if w = request("PATCH", session, in); w.Code != 409 {
+		t.Fatal("old delete revision accepted")
+	}
+	in.Revision = revision
+	if w = request("PATCH", session, in); w.Code != 404 {
+		t.Fatal("deleted binding still found")
+	}
+}

@@ -1,0 +1,635 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// User-supplied sites must never gain access to the cluster, metadata service,
+// or credentials through redirects. Resolve and validate on every connection.
+func subPublicIP(ip net.IP) bool {
+	return ip != nil && ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.Equal(net.ParseIP("100.100.100.200")) && !(&net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}).Contains(ip)
+}
+
+func subBase(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || len(raw) > 2048 {
+		return "", errors.New("请输入不含用户名、查询参数的 HTTPS 站点地址")
+	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil && !subPublicIP(ip) {
+		return "", errors.New("请使用公网 sub2api 地址")
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	for _, suffix := range []string{"/api/v1", "/v1"} {
+		u.Path = strings.TrimSuffix(u.Path, suffix)
+	}
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+func newSubHTTP() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil || len(ips) == 0 {
+			return nil, errors.New("站点域名无法解析")
+		}
+		for _, ip := range ips {
+			if !subPublicIP(ip.IP) {
+				return nil, errors.New("不允许访问内部地址")
+			}
+		}
+		dialer := net.Dialer{Timeout: 10 * time.Second}
+		for _, ip := range ips {
+			conn, e := dialer.DialContext(ctx, network, net.JoinHostPort(ip.IP.String(), port))
+			if e == nil {
+				return conn, nil
+			}
+			err = e
+		}
+		return nil, err
+	}
+	transport.ResponseHeaderTimeout = 25 * time.Second
+	transport.MaxConnsPerHost = 8
+	return &http.Client{Transport: transport, Timeout: 60 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
+
+var subHTTP = newSubHTTP()
+
+type subRemoteError struct {
+	Status int
+	Reason string
+}
+
+const subSessionExpiredMessage = "站点保存的登录会话已失效，请重新登录站点后继续"
+const subMissingLoginPasswordMessage = "站点会话无法自动续期，尚未保存登录密码；请补填一次密码，后续将自动登录"
+
+func subMissingLoginPasswordError(refreshErr error) error {
+	var remote *subRemoteError
+	if refreshErr != nil && !(errors.As(refreshErr, &remote) && remote.Status == http.StatusUnauthorized) {
+		return refreshErr
+	}
+	return errors.New(subMissingLoginPasswordMessage)
+}
+
+func (e *subRemoteError) Error() string {
+	if strings.Contains(e.Reason, "CAPTCHA") || strings.Contains(e.Reason, "TURNSTILE") {
+		return "站点要求人机验证；请在该站点完成登录后，使用会话令牌接入"
+	}
+	switch e.Status {
+	case 401:
+		if e.Reason == "SITE_SESSION_EXPIRED" || e.Reason == "TOKEN_EXPIRED" || strings.HasPrefix(e.Reason, "REFRESH_TOKEN_") {
+			return subSessionExpiredMessage
+		}
+		return "站点登录已失效或账号密码不正确，请重新登录"
+	case 403:
+		return "站点拒绝访问，请检查账号权限、验证要求或站点防护"
+	case 429:
+		return "站点限流，请稍后重试"
+	default:
+		return fmt.Sprintf("站点接口返回 HTTP %d", e.Status)
+	}
+}
+
+var errSubResponseTooLarge = errors.New("站点响应过大或读取失败")
+
+// Never forward upstream error messages: they may echo passwords or API keys.
+func subJSON(ctx context.Context, client *http.Client, base, method, path, token string, body any, out any, idempotency string) error {
+	var buf io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		buf = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, base+path, buf)
+	if err != nil {
+		return errors.New("站点地址无效")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if idempotency != "" {
+		req.Header.Set("Idempotency-Key", idempotency)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return errors.New("无法连接站点或请求超时")
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (4<<20)+1))
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return errors.New("站点响应过大或读取失败")
+	}
+	if len(raw) > 4<<20 {
+		return errSubResponseTooLarge
+	}
+	var envelope struct {
+		Code   json.RawMessage `json:"code"`
+		Reason string          `json:"reason"`
+		Data   json.RawMessage `json:"data"`
+	}
+	parseErr := json.Unmarshal(raw, &envelope)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// sub2api forks use both numeric and string error codes. Keep only the
+		// code for classification, never the upstream message or response body.
+		if envelope.Reason == "" {
+			_ = json.Unmarshal(envelope.Code, &envelope.Reason)
+		}
+		if resp.StatusCode == 401 {
+			if strings.HasPrefix(path, "/api/v1/auth/login") {
+				// Login failures are credential errors; all other 401s are
+				// failures of the saved site session.
+				envelope.Reason = "INVALID_CREDENTIALS"
+			} else {
+				envelope.Reason = "SITE_SESSION_EXPIRED"
+			}
+		}
+		return &subRemoteError{resp.StatusCode, envelope.Reason}
+	}
+	var code int
+	if parseErr != nil || (len(envelope.Code) > 0 && json.Unmarshal(envelope.Code, &code) != nil) || code != 0 || len(envelope.Data) == 0 {
+		return errors.New("站点返回了不兼容的 sub2api 数据")
+	}
+	if out != nil && json.Unmarshal(envelope.Data, out) != nil {
+		return errors.New("站点返回的数据格式不兼容")
+	}
+	return nil
+}
+
+type subAuth struct {
+	Kind         string            `json:"kind,omitempty"`
+	UserID       int64             `json:"user_id,omitempty"`
+	Username     string            `json:"username,omitempty"`
+	Cookies      map[string]string `json:"cookies,omitempty"`
+	SessionID    string            `json:"session_id,omitempty"`
+	QuotaPerUnit float64           `json:"quota_per_unit,omitempty"`
+	Access       string            `json:"access_token"`
+	Refresh      string            `json:"refresh_token"`
+	ExpiresIn    int               `json:"expires_in"`
+	ExpiresAt    int64             `json:"expires_at"`
+	Requires2FA  bool              `json:"requires_2fa"`
+	Temp         string            `json:"temp_token"`
+}
+
+type subRemoteGroup struct {
+	ID       int64   `json:"id"`
+	Status   string  `json:"status,omitempty"`
+	Name     string  `json:"name"`
+	Platform string  `json:"platform"`
+	Rate     float64 `json:"rate_multiplier"`
+	Peak     bool    `json:"peak_rate_enabled"`
+}
+type subRemoteKey struct {
+	CreatedAt *time.Time `json:"created_at"`
+	ID        int64      `json:"id"`
+	Key       string     `json:"key"`
+	Name      string     `json:"name"`
+	GroupID   int64      `json:"group_id"`
+	Status    string     `json:"status"`
+	ExpiresAt *time.Time `json:"expires_at"`
+	Quota     *float64   `json:"quota,omitempty"`
+	QuotaUsed *float64   `json:"quota_used,omitempty"`
+}
+
+type subProbe struct {
+	ID             string    `json:"id,omitempty"`
+	StartedAt      int64     `json:"started_at,omitempty"`
+	RequestIDs     []string  `json:"request_ids,omitempty"`
+	Usage          *subUsage `json:"usage,omitempty"`
+	RequestedModel string    `json:"requested_model,omitempty"`
+	ResponseModel  string    `json:"response_model,omitempty"`
+	ModelMatch     string    `json:"model_match,omitempty"`
+	Status         string    `json:"status"`
+	// Warnings distinguish missing completion from missing terminal output.
+	// Both remain manually selectable, without becoming import defaults.
+	TerminalStatus    string `json:"terminal_status,omitempty"`
+	Text              string `json:"text"`
+	Message           string `json:"message,omitempty"`
+	TTFT              *int64 `json:"ttft_ms"`
+	ResponseCreatedMS *int64 `json:"response_created_ms"`
+	FirstResponseMS   *int64 `json:"first_response_ms,omitempty"`
+	Protocol          string `json:"protocol,omitempty"`
+	Duration          int64  `json:"duration_ms"`
+	HTTPStatus        int    `json:"http_status,omitempty"`
+}
+
+// Availability can tolerate a missing terminal event; quality verdicts cannot
+// use a potentially truncated answer as a completed pass/fail measurement.
+func (p subProbe) qualityResult() subProbe {
+	if p.Status == "success" && p.TerminalStatus == "missing" {
+		p.Status = "error"
+		p.Message = "缺少结束事件，无法完成降智判定"
+	}
+	return p
+}
+
+type subResult struct {
+	Model        string   `json:"model"`
+	CheckedAt    int64    `json:"checked_at"`
+	Availability subProbe `json:"availability"`
+	Quality      subProbe `json:"quality"`
+	Verdict      string   `json:"verdict"`
+}
+
+// Only output_text deltas are first text. Clean EOF with usable text but no
+// completion event is selectable availability evidence with a terminal warning.
+// Explicit failure events and transport/parser errors remain failures.
+func subProbeStream(ctx context.Context, client *http.Client, base, key, prompt string, models ...string) (out subProbe) {
+	start := time.Now()
+	out.ID = "subcheck-" + randomID()
+	out.StartedAt = start.Unix()
+	out.RequestIDs = []string{out.ID, "local:" + out.ID}
+	out.Status = "error"
+	out.Protocol = "responses"
+	defer func() { out.Duration = time.Since(start).Milliseconds() }()
+	model := checkModel
+	if len(models) > 0 {
+		model = models[0]
+	}
+	out.RequestedModel = model
+	out.ModelMatch = "unavailable"
+	body, _ := json.Marshal(map[string]any{"model": model, "input": []map[string]string{{"role": "user", "content": prompt}}, "stream": true})
+	req, _ := http.NewRequestWithContext(ctx, "POST", base+"/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("X-Request-ID", out.ID)
+	resp, err := client.Do(req)
+	if err != nil {
+		out.Message = "连接失败或检测超时"
+		return
+	}
+	defer resp.Body.Close()
+	out.HTTPStatus = resp.StatusCode
+	if values := resp.Header.Values("X-Oneapi-Request-Id"); len(values) == 1 {
+		if id := subSafeRequestID(values[0], key); id != "" {
+			out.addRequestIDs("newapi:" + id)
+		}
+	}
+	for _, header := range []string{"X-Client-Request-ID", "X-Request-ID", "Request-ID"} {
+		if value := subSafeRequestID(resp.Header.Get(header), key); value != "" {
+			out.addRequestIDs(value, "client:"+value, "local:"+value)
+		}
+	}
+	if resp.StatusCode != 200 {
+		out.Message = fmt.Sprintf("检测请求返回 HTTP %d", resp.StatusCode)
+		return
+	}
+	if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		out.Message = "站点未返回 SSE 流式响应"
+		return
+	}
+	limited := &io.LimitedReader{R: resp.Body, N: (2 << 20) + 1}
+	scanner := bufio.NewScanner(limited)
+	scanner.Buffer(make([]byte, 4096), 512<<10)
+	var data strings.Builder
+	var eventName string
+	completedItems := map[int]string{}
+	completedBytes := 0
+	finalItems := func() string {
+		indices := make([]int, 0, len(completedItems))
+		for index := range completedItems {
+			indices = append(indices, index)
+		}
+		sort.Ints(indices)
+		var text strings.Builder
+		for _, index := range indices {
+			text.WriteString(completedItems[index])
+		}
+		return text.String()
+	}
+	var lastModel json.RawMessage
+	consume := func() bool {
+		payload := strings.TrimSpace(data.String())
+		data.Reset()
+		if payload == "" || payload == "[DONE]" {
+			eventName = ""
+			return false
+		}
+		var event struct {
+			Type        string `json:"type"`
+			Delta       string `json:"delta"`
+			OutputIndex int    `json:"output_index"`
+			Item        struct {
+				Type    string `json:"type"`
+				Role    string `json:"role"`
+				Status  string `json:"status"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"item"`
+			Response struct {
+				ID     string          `json:"id"`
+				Model  json.RawMessage `json:"model"`
+				Status string          `json:"status"`
+				Error  json.RawMessage `json:"error"`
+				Output []struct {
+					Type    string `json:"type"`
+					Role    string `json:"role"`
+					Content []struct {
+						Type string `json:"type"`
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"output"`
+			} `json:"response"`
+		}
+		if json.Unmarshal([]byte(payload), &event) != nil {
+			out.Message = "流式事件格式无效"
+			return true
+		}
+		if event.Type == "" {
+			event.Type = eventName
+		}
+		eventName = ""
+		if value := subSafeRequestID(event.Response.ID, key); value != "" && (event.Type == "response.created" || event.Type == "response.completed") {
+			out.addRequestIDs(value)
+		}
+		if event.Type == "response.created" || event.Type == "response.in_progress" {
+			if len(event.Response.Model) > 0 {
+				lastModel = event.Response.Model
+			}
+		}
+		switch event.Type {
+		case "error", "response.failed", "response.incomplete":
+			out.Message = "模型响应失败或未完成"
+			return true
+		case "response.created":
+			if out.ResponseCreatedMS == nil {
+				ms := time.Since(start).Milliseconds()
+				out.ResponseCreatedMS = &ms
+			}
+		case "response.output_text.delta":
+			if event.Delta != "" {
+				if out.TTFT == nil {
+					ms := time.Since(start).Milliseconds()
+					out.TTFT = &ms
+				}
+				out.Text += event.Delta
+				if len(out.Text) > 8192 {
+					out.Message = "检测回复超出长度限制"
+					return true
+				}
+			}
+		case "response.output_item.done":
+			if event.Item.Type == "message" && event.Item.Role == "assistant" && event.Item.Status == "completed" {
+				var final strings.Builder
+				for _, c := range event.Item.Content {
+					if c.Type == "output_text" {
+						final.WriteString(c.Text)
+					}
+				}
+				if text := final.String(); strings.TrimSpace(text) != "" {
+					size := completedBytes - len(completedItems[event.OutputIndex]) + len(text)
+					if size > 8192 {
+						out.Message = "检测回复超出长度限制"
+						return true
+					}
+					completedBytes = size
+					completedItems[event.OutputIndex] = text
+				}
+			}
+		case "response.completed":
+			if event.Response.Status != "completed" || (len(event.Response.Error) > 0 && string(event.Response.Error) != "null") {
+				out.Message = "模型未完整完成"
+				return true
+			}
+			var final strings.Builder
+			for _, item := range event.Response.Output {
+				if item.Type == "message" && item.Role == "assistant" {
+					for _, c := range item.Content {
+						if c.Type == "output_text" {
+							final.WriteString(c.Text)
+						}
+					}
+				}
+			}
+			text := strings.TrimSpace(final.String())
+			// Some Responses-compatible gateways put the completed assistant
+			// message in response.output_item.done and leave response.completed
+			// output empty. A text delta is the final fallback when that happens.
+			if text == "" && len(event.Response.Output) == 0 {
+				text = strings.TrimSpace(finalItems())
+				if text == "" {
+					text = strings.TrimSpace(out.Text)
+				}
+				out.TerminalStatus = "missing_output"
+				out.Message = "成功，但结束事件缺少最终文本"
+			}
+			if len(text) > 8192 || text == "" {
+				out.Message = "模型未返回有效最终文本"
+				return true
+			}
+			out.Text = text
+			if out.TerminalStatus == "" {
+				out.TerminalStatus = "complete"
+			}
+			if out.TTFT == nil && out.Message == "" {
+				out.Message = "响应完成，但缺少文本增量，无法测量首字延迟"
+			}
+			out.Status = "success"
+			out.ResponseModel, out.ModelMatch = subCompareModel(model, event.Response.Model)
+			// An untrusted endpoint may echo the credential into any string field.
+			if key != "" {
+				out.ResponseModel = strings.ReplaceAll(out.ResponseModel, key, "[redacted]")
+			}
+			return true
+		}
+		return false
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if consume() {
+				return
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(line[6:])
+		}
+		if strings.HasPrefix(line, "data:") {
+			data.WriteString(strings.TrimPrefix(line[5:], " "))
+			data.WriteByte('\n')
+			if data.Len() > 512<<10 {
+				out.Message = "流式事件过大"
+				return
+			}
+		}
+	}
+	if scanner.Err() != nil || ctx.Err() != nil || limited.N == 0 {
+		out.Message = "流式读取失败、超时或超过长度限制"
+		return
+	}
+	if data.Len() > 0 && consume() {
+		return
+	}
+	// A 200 SSE response with valid assistant text is useful evidence even if
+	// the upstream closes without response.completed. Keep it selectable while
+	// surfacing the missing terminal event as a warning for the UI and default
+	// selection logic.
+	if completedBytes > 0 {
+		out.Text = finalItems()
+	}
+	if strings.TrimSpace(out.Text) != "" {
+		out.Status = "success"
+		out.TerminalStatus = "missing"
+		out.Message = "成功，但缺少结束事件"
+		out.ResponseModel, out.ModelMatch = subCompareModel(model, lastModel)
+		if key != "" {
+			out.ResponseModel = strings.ReplaceAll(out.ResponseModel, key, "[redacted]")
+		}
+		return
+	}
+	out.Message = "流式连接中断或缺少完成事件"
+	return
+}
+
+// Completion metadata is authoritative; a missing-completion warning can use
+// observed creation metadata. Never substitute the requested model or text.
+// Malformed model metadata does not erase a valid availability/latency result.
+func subCompareModel(requested string, raw json.RawMessage) (string, string) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", "missing"
+	}
+	var returned string
+	if json.Unmarshal(raw, &returned) != nil || len(returned) > 512 {
+		return "", "invalid"
+	}
+	if strings.TrimSpace(returned) == "" {
+		return "", "missing"
+	}
+	if returned == requested {
+		return returned, "match"
+	}
+	return returned, "mismatch"
+}
+
+func subModelProtocol(model string) string {
+	if model == "gemini-3.1-pro" || model == "gemini-3.8-flash" {
+		return "gemini"
+	}
+	if strings.HasPrefix(model, "claude-") {
+		return "messages"
+	}
+	return "responses"
+}
+
+func subModelAllowed(model string) bool {
+	for _, m := range subModels {
+		if m == model {
+			return true
+		}
+	}
+	return false
+}
+
+// Detection settings can include models discovered in configured channels.
+// They are names sent in a fixed protocol payload, never URLs or route changes.
+func validProbeModel(model string) bool {
+	return strings.TrimSpace(model) == model && model != "" && len(model) <= 256 && !strings.ContainsAny(model, "\r\n\x00")
+}
+func subRunProbes(ctx context.Context, client *http.Client, base, key string, models ...string) subResult {
+	model := checkModel
+	if len(models) > 0 {
+		model = models[0]
+	}
+	out := subResult{Model: model, Verdict: "error", Quality: subProbe{Status: "skipped", Message: "可用性检测未通过"}}
+	if subModelProtocol(model) == "responses" {
+		out.Availability = subProbeStream(ctx, client, base, key, "say test", model)
+	} else {
+		out.Availability = subProbeNative(ctx, client, base, key, model)
+	}
+	if model != checkModel {
+		out.Verdict = "not_applicable"
+		out.Quality = subProbe{Status: "not_applicable", Message: "该模型不执行降智检测"}
+		out.CheckedAt = time.Now().Unix()
+		return out
+	}
+	if out.Availability.Status == "success" && ctx.Err() == nil {
+		out.Quality = subProbeStream(ctx, client, base, key, checkPrompt).qualityResult()
+		if out.Quality.Status == "success" {
+			out.Verdict = checkVerdict(out.Quality.Text)
+		}
+	}
+	out.CheckedAt = time.Now().Unix()
+	return out
+}
+
+// The quality response also measures Astra availability, latency and model
+// identity. All fields come from the same request; no say-test probe is sent.
+func subRunQualityProbe(ctx context.Context, client *http.Client, base, key string) subResult {
+	probe := subProbeStream(ctx, client, base, key, checkPrompt, checkModel)
+	out := subResult{Model: checkModel, CheckedAt: time.Now().Unix(), Availability: probe, Quality: probe.qualityResult(), Verdict: "error"}
+	if out.Quality.Status == "success" {
+		out.Verdict = checkVerdict(probe.Text)
+	}
+	return out
+}
+
+func subKeyName(accountID string, groupID int64) string {
+	return "uni-console-check-" + accountID + "-" + strconv.FormatInt(groupID, 10)
+}
+
+// Billing is a key-scoped snapshot: the upstream applies user overrides and its
+// own timezone/peak rules. Older sites fall back only when the panel provided
+// user rates and the group has no peak pricing.
+type subBilling struct {
+	Rate      *float64 `json:"rate"`
+	Source    string   `json:"source"`
+	CheckedAt int64    `json:"checked_at"`
+}
+
+func subKeyBilling(ctx context.Context, client *http.Client, base, key string, fallback subBilling) subBilling {
+	callCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, "GET", base+"/v1/sub2api/billing", nil)
+	if err != nil {
+		return fallback
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fallback
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fallback
+	}
+	var doc struct {
+		Object string   `json:"object"`
+		Scope  string   `json:"billing_scope"`
+		Rate   *float64 `json:"effective_rate_multiplier"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&doc) != nil || doc.Object != "sub2api.key_billing" || doc.Scope != "token" || doc.Rate == nil || *doc.Rate < 0 {
+		return fallback
+	}
+	return subBilling{Rate: doc.Rate, Source: "key", CheckedAt: time.Now().Unix()}
+}

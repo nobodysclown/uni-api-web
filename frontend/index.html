@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>网关管理</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>◈</text></svg>">
+<script>
+// 渲染前同步判断登录态，避免登录页闪烁
+(function(){try{var b=localStorage.getItem('uni-admin:base'),k=localStorage.getItem('uni-admin:key');
+document.documentElement.dataset.auth=(b&&k)?'1':'';}catch(e){}})();
+</script>
+<link rel="stylesheet" href="style.css?v=20261004h">
+</head>
+<body>
+<!-- 登录页 -->
+<div id="login-page" class="login-page">
+  <div class="login-card">
+    <div class="login-logo">◈</div>
+    <h1>网关管理</h1>
+    <p class="login-sub">连接你的 uni-api 网关</p>
+    <div class="field">
+      <label>服务地址</label>
+      <input id="login-base" class="input" type="text" placeholder="https://your-gateway-host" value="" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>管理密钥</label>
+      <input id="login-key" class="input" type="password" placeholder="输入管理密钥" autocomplete="off">
+    </div>
+    <label class="remember"><input type="checkbox" id="remember-me" checked> 记住密码</label>
+    <div id="login-error" class="error-msg"></div>
+    <button id="login-btn" class="btn-primary btn-block">连接</button>
+  </div>
+</div>
+
+<!-- 主界面 -->
+<div id="app" class="app" style="display:none">
+  <header class="topbar">
+    <div class="topbar-title"><span class="logo">◈</span> 网关管理</div>
+    <nav class="topbar-nav">
+      <button class="nav-btn active" data-page="stats">数据统计</button>
+      <button class="nav-btn" data-page="logs">调用明细</button>
+      <button class="nav-btn" data-page="providers">提供商管理</button>
+    </nav>
+    <button id="logout-btn" class="btn-ghost">断开</button>
+  </header>
+  <div id="net-banner" class="net-banner">连接网关失败，数据可能不是最新的。<button id="net-retry">重试</button></div>
+
+  <!-- 数据统计页 -->
+  <main id="page-stats" class="page">
+    <div class="page-head">
+      <h2>数据统计</h2>
+      <span class="muted" style="padding:0">最近 24 小时</span>
+    </div>
+    <div id="stats-error" class="error-msg"></div>
+    <div class="stat-cards">
+      <div class="stat-card"><div class="stat-label">总请求</div><div class="stat-value" id="stat-requests">—</div></div>
+      <div class="stat-card"><div class="stat-label">成功请求</div><div class="stat-value" id="stat-success">—</div></div>
+      <div class="stat-card"><div class="stat-label">成功率</div><div class="stat-value" id="stat-rate">—</div></div>
+      <div class="stat-card"><div class="stat-label">活跃模型</div><div class="stat-value" id="stat-models">—</div></div>
+      <div class="stat-card"><div class="stat-label">活跃渠道</div><div class="stat-value" id="stat-providers">—</div></div>
+    </div>
+    <div class="section-head"><h3>模型统计</h3></div>
+    <div class="table-wrap"><table class="data-table">
+      <thead><tr><th>模型</th><th>提供商</th><th>请求数</th><th>成功率</th></tr></thead>
+      <tbody id="model-stats-body"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
+    </table></div>
+    <div class="section-head"><h3>渠道统计</h3></div>
+    <div class="table-wrap"><table class="data-table">
+      <thead><tr><th>提供商</th><th>请求数</th><th>成功率</th></tr></thead>
+      <tbody id="provider-stats-body"><tr><td colspan="3" class="muted">加载中…</td></tr></tbody>
+    </table></div>
+  </main>
+
+  <!-- 调用明细页 -->
+  <main id="page-logs" class="page" style="display:none">
+    <div class="page-head">
+      <h2>调用明细</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="muted" style="padding:0">最近 24 小时</span>
+        <button id="logs-refresh" class="btn-ghost">↻ 刷新</button>
+      </div>
+    </div>
+    <div id="logs-error" class="error-msg"></div>
+    <div class="section-head"><h3>接口调用</h3></div>
+    <div class="table-wrap"><table class="data-table">
+      <thead><tr><th>接口</th><th>请求数</th></tr></thead>
+      <tbody id="endpoint-body"><tr><td colspan="2" class="muted">加载中…</td></tr></tbody>
+    </table></div>
+    <div class="section-head"><h3>来源 IP</h3></div>
+    <div class="table-wrap"><table class="data-table">
+      <thead><tr><th>IP</th><th>请求数</th></tr></thead>
+      <tbody id="ip-body"><tr><td colspan="2" class="muted">加载中…</td></tr></tbody>
+    </table></div>
+    <p class="muted" style="margin-top:16px;font-size:12px">网关仅提供聚合统计，不记录单条请求明细</p>
+  </main>
+
+  <!-- 提供商管理页 -->
+  <main id="page-providers" class="page" style="display:none">
+    <div class="page-head">
+      <h2>提供商管理</h2>
+      <div>
+        <button id="add-provider-btn" class="btn-primary">+ 添加提供商</button>
+        <button id="save-config-btn" class="btn-save">保存设置</button>
+      </div>
+    </div>
+    <div id="providers-error" class="error-msg"></div>
+    <div id="save-status" class="save-status"></div>
+    <div id="provider-list" class="provider-list"></div>
+  </main>
+</div>
+
+<!-- 提供商卡片模板 -->
+<template id="provider-tpl">
+  <div class="provider-card">
+    <div class="card-head">
+      <input class="p-name input input-lg" placeholder="提供商名称，如 openai" autocomplete="off">
+      <div class="card-actions">
+        <button class="btn-icon btn-dup" title="复制提供商">⧉</button>
+        <button class="btn-icon btn-del danger" title="删除提供商">✕</button>
+      </div>
+    </div>
+    <div class="form-grid">
+      <div class="field">
+        <label>Base URL</label>
+        <input class="p-baseurl input" placeholder="https://api.openai.com/v1" autocomplete="off">
+      </div>
+      <div class="field">
+        <label>备注</label>
+        <input class="p-notes input" placeholder="备注（可选）" autocomplete="off">
+      </div>
+    </div>
+    <div class="field">
+      <label>API 密钥 <span class="hint">可添加多个，自动轮询</span></label>
+      <div class="p-keys"></div>
+      <button class="btn-dashed btn-add-key">+ 添加密钥</button>
+    </div>
+    <div class="field">
+      <label>模型 <span class="hint">原始模型名 → 对外别名（可选）</span></label>
+      <div class="p-models"></div>
+      <button class="btn-dashed btn-add-model">+ 添加模型</button>
+    </div>
+    <details class="advanced">
+      <summary>高级设置</summary>
+      <div class="field">
+        <label>偏好设置（JSON）</label>
+        <textarea class="p-prefs input" rows="3" placeholder='{"proxy": "socks5://..."}' spellcheck="false"></textarea>
+      </div>
+    </details>
+  </div>
+</template>
+
+<template id="key-tpl">
+  <div class="key-row">
+    <input class="k-value input mono" type="password" placeholder="输入 API Key" autocomplete="off" spellcheck="false">
+    <button class="btn-icon btn-toggle-key" title="显示 / 隐藏">👁</button>
+    <button class="btn-icon btn-del-key danger" title="删除密钥">✕</button>
+  </div>
+</template>
+
+<template id="model-tpl">
+  <div class="model-row">
+    <input class="m-original input mono" placeholder="原始模型名" autocomplete="off" spellcheck="false">
+    <span class="arrow">→</span>
+    <input class="m-alias input mono" placeholder="别名（可选）" autocomplete="off" spellcheck="false">
+    <button class="btn-icon btn-del-model danger" title="删除模型">✕</button>
+  </div>
+</template>
+
+<script src="app.js?v=20261004g"></script>
+</body>
+</html>

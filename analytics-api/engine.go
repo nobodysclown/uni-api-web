@@ -1,0 +1,479 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	duckdb "github.com/duckdb/duckdb-go/v2"
+)
+
+var histogramBounds = []float64{1, 2, 5, 10, 20, 50, 100, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 7500, 10000, 15000, 20000, 30000, 45000, 60000, 90000, 120000, 180000, 300000, 600000, 1200000, math.Inf(1)}
+
+type Engine struct {
+	DB          *sql.DB
+	historyPath string
+	cfg         Config
+	mu          sync.Mutex
+	Revision    atomic.Uint64
+	Location    *time.Location
+}
+
+func OpenEngine(path string, cfg Config) (*Engine, error) {
+	location, err := time.LoadLocation(cfg.Timezone)
+	if err != nil {
+		return nil, err
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	var attached atomic.Bool
+	connector, err := duckdb.NewConnector("", func(conn driver.ExecerContext) error {
+		if !attached.Load() {
+			return nil
+		}
+		_, err := conn.ExecContext(context.Background(), "SET search_path='settings,history'", nil)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	db := sql.OpenDB(connector)
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	if _, err = db.Exec("ATTACH " + sqlPath(path+".settings") + " AS settings; ATTACH " + sqlPath(path) + " AS history; SET search_path='settings,history'"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	attached.Store(true)
+	e := &Engine{DB: db, cfg: cfg, Location: location, historyPath: path}
+	if err = e.migrateSettings(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	memoryMB := cfg.DatabaseMemoryLimitMB
+	if memoryMB == 0 {
+		memoryMB = 512
+	} // Small embedded/test engines retain their existing default.
+	if memoryMB < 64 {
+		db.Close()
+		return nil, errors.New("database memory limit must be at least 64 MiB")
+	}
+	if _, err = db.Exec(fmt.Sprintf("SET memory_limit='%dMiB';", memoryMB) + ` SET threads=2;
+ CREATE TABLE IF NOT EXISTS history.facts(event_id VARCHAR PRIMARY KEY,kind VARCHAR NOT NULL,source_id VARCHAR DEFAULT 'primary',instance_id VARCHAR,request_id VARCHAR,attempt_id VARCHAR,at_ms BIGINT,started_ms BIGINT,key_id VARCHAR,provider VARCHAR,model VARCHAR,upstream_model VARCHAR,endpoint VARCHAR,stream BOOLEAN,outcome VARCHAR,status INTEGER,duration_ms DOUBLE,dispatch_ms DOUBLE,first_output_ms DOUBLE,input_tokens BIGINT,output_tokens BIGINT,cache_read_tokens BIGINT,cache_write_tokens BIGINT,cache_write_1h_tokens BIGINT,actual_cost_usd DOUBLE);
+ CREATE TABLE IF NOT EXISTS history.imported_objects(object_key VARCHAR PRIMARY KEY,etag VARCHAR,imported_at TIMESTAMP DEFAULT current_timestamp,events BIGINT);
+ CREATE TABLE IF NOT EXISTS prices(model VARCHAR PRIMARY KEY,input DOUBLE,output DOUBLE,cache_read DOUBLE,cache_write DOUBLE,cache_write_1h DOUBLE,source VARCHAR,verified BOOLEAN,effective_at TIMESTAMP);
+ CREATE TABLE IF NOT EXISTS price_history(model VARCHAR,document VARCHAR,updated_at TIMESTAMP DEFAULT current_timestamp);
+ CREATE TABLE IF NOT EXISTS meta(name VARCHAR PRIMARY KEY,value VARCHAR);
+ CREATE TABLE IF NOT EXISTS history.rollups(period_ms BIGINT,level VARCHAR,kind VARCHAR,source_id VARCHAR DEFAULT 'primary',key_id VARCHAR,provider VARCHAR,model VARCHAR,upstream_model VARCHAR,endpoint VARCHAR,stream BOOLEAN,outcome VARCHAR,n BIGINT,input_tokens HUGEINT,output_tokens HUGEINT,cache_read_tokens HUGEINT,cache_write_tokens HUGEINT,cache_write_1h_tokens HUGEINT,usage_samples BIGINT,cache_samples BIGINT,actual_cost_usd DOUBLE,actual_cost_samples BIGINT,first_bins BIGINT[],dispatch_bins BIGINT[],first_count BIGINT,dispatch_count BIGINT,first_sum DOUBLE,dispatch_sum DOUBLE,last_ms BIGINT,last_first DOUBLE,last_dispatch DOUBLE);
+ ALTER TABLE history.facts ADD COLUMN IF NOT EXISTS source_id VARCHAR DEFAULT 'primary'; ALTER TABLE history.rollups ADD COLUMN IF NOT EXISTS source_id VARCHAR DEFAULT 'primary'; CREATE INDEX IF NOT EXISTS facts_at ON history.facts(at_ms);`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// New clocks are additive: old facts and cached rollups have no samples.
+	if _, err = db.Exec(`
+      ALTER TABLE prices ADD COLUMN IF NOT EXISTS charge_cache_write BOOLEAN;
+      ALTER TABLE prices ADD COLUMN IF NOT EXISTS sale_percent DOUBLE;
+      ALTER TABLE prices ADD COLUMN IF NOT EXISTS long_context_premium BOOLEAN;
+      ALTER TABLE history.facts ADD COLUMN IF NOT EXISTS upstream_base VARCHAR;
+      ALTER TABLE history.facts ADD COLUMN IF NOT EXISTS upstream_key_hash VARCHAR;
+      ALTER TABLE history.facts ADD COLUMN IF NOT EXISTS billing_request_ids VARCHAR[];
+      ALTER TABLE history.facts ADD COLUMN IF NOT EXISTS upstream_error_sha256 VARCHAR;
+      ALTER TABLE history.facts ADD COLUMN IF NOT EXISTS response_created_ms DOUBLE;
+      ALTER TABLE history.facts ADD COLUMN IF NOT EXISTS first_text_ms DOUBLE;
+      ALTER TABLE history.rollups ADD COLUMN IF NOT EXISTS created_bins BIGINT[];
+      ALTER TABLE history.rollups ADD COLUMN IF NOT EXISTS created_count BIGINT DEFAULT 0;
+      ALTER TABLE history.rollups ADD COLUMN IF NOT EXISTS created_sum DOUBLE DEFAULT 0;
+      ALTER TABLE history.rollups ADD COLUMN IF NOT EXISTS last_created DOUBLE;
+      ALTER TABLE history.rollups ADD COLUMN IF NOT EXISTS text_bins BIGINT[];
+      ALTER TABLE history.rollups ADD COLUMN IF NOT EXISTS text_count BIGINT DEFAULT 0;
+      ALTER TABLE history.rollups ADD COLUMN IF NOT EXISTS text_sum DOUBLE DEFAULT 0;
+      ALTER TABLE history.rollups ADD COLUMN IF NOT EXISTS last_text DOUBLE;
+    `); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err = db.Exec(requestTraceSchema("history.")); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := e.seedDefaultPrices(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return e, nil
+}
+func (e *Engine) Close() error { return e.DB.Close() }
+func validFact(f Fact) error {
+	if f.Schema != 1 || f.EventID == "" || len(f.EventID) > 256 || f.AtMS <= 0 || f.AtMS > time.Now().Add(5*time.Minute).UnixMilli() {
+		return errors.New("invalid fact identity or timestamp")
+	}
+	if f.Kind != "request" && f.Kind != "attempt" && f.Kind != "dispatch" && f.Kind != "billing" && f.Kind != "trace" {
+		return errors.New("unknown fact kind")
+	}
+	for _, v := range []string{f.TraceID, f.Stage, f.RequestID, f.AttemptID, f.KeyID, f.Provider, f.Model, f.UpstreamModel, f.Endpoint, f.InstanceID} {
+		if len(v) > 512 {
+			return errors.New("fact field too long")
+		}
+	}
+	if len(f.UpstreamBase) > 2048 || len(f.UpstreamKeyHash) > 64 || len(f.BillingRequestIDs) > 3 {
+		return errors.New("invalid receipt correlation")
+	}
+	for _, id := range f.BillingRequestIDs {
+		if id == "" || len(id) > 256 {
+			return errors.New("invalid receipt identifier")
+		}
+	}
+	if f.UpstreamErrorSHA256 != "" && !validErrorDigest(f.UpstreamErrorSHA256) {
+		return errors.New("invalid upstream error digest")
+	}
+	for _, v := range []*int64{f.InputTokens, f.OutputTokens, f.CacheReadTokens, f.CacheWriteTokens, f.CacheWrite1hTokens} {
+		if v != nil && *v < 0 {
+			return errors.New("negative token usage")
+		}
+	}
+	for _, v := range []*float64{f.DurationMS, f.DispatchMS, f.FirstOutputMS, f.ResponseCreatedMS, f.FirstTextMS, f.ActualCostUSD} {
+		if v != nil && (*v < 0 || math.IsNaN(*v) || math.IsInf(*v, 0)) {
+			return errors.New("invalid fact measurement")
+		}
+	}
+	return nil
+}
+func (e *Engine) Imported(ctx context.Context, key, etag string) (bool, error) {
+	var stored string
+	err := e.DB.QueryRowContext(ctx, "SELECT etag FROM imported_objects WHERE object_key=?", key).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if stored != etag {
+		return false, errors.New("immutable S3 fact object changed")
+	}
+	return true, nil
+}
+
+type FactObject struct {
+	Key, ETag string
+	Facts     []Fact
+}
+
+func (e *Engine) Import(ctx context.Context, key, etag string, facts []Fact) error {
+	return e.ImportBatch(ctx, []FactObject{{Key: key, ETag: etag, Facts: facts}})
+}
+
+// Validate every object before the transaction. Commit facts, affected rollups
+// and object checkpoints atomically, so replay after a crash is idempotent.
+func (e *Engine) ImportBatch(ctx context.Context, objects []FactObject) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	pending := make([]FactObject, 0, len(objects))
+	seen := map[string]string{}
+	for _, obj := range objects {
+		if etag, ok := seen[obj.Key]; ok {
+			if etag != obj.ETag {
+				return errors.New("immutable object changed")
+			}
+			continue
+		}
+		seen[obj.Key] = obj.ETag
+		imported, err := e.Imported(ctx, obj.Key, obj.ETag)
+		if err != nil {
+			return err
+		}
+		if imported {
+			continue
+		}
+		for _, f := range obj.Facts {
+			if f.SourceID == "" {
+				f.SourceID = e.cfg.SourceID
+				if f.SourceID == "" {
+					f.SourceID = "primary"
+				}
+			}
+			if err := validFact(f); err != nil {
+				return err
+			}
+		}
+		pending = append(pending, obj)
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	// A single JSON scan avoids retaining a separate INSERT execution state
+	// for every event in the transaction (large batches exhausted DuckDB's
+	// memory budget even when the event payload itself was small).
+	file, err := os.CreateTemp(e.cfg.DataDir, "fact-batch-*.jsonl")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	encoder := json.NewEncoder(file)
+	var factCount int
+	for _, obj := range pending {
+		for _, fact := range obj.Facts {
+			reason := factFailureReason(fact)
+			fact.Outcome = factMetricOutcome(fact)
+			if reason != "" {
+				fact.Outcome = "failed/" + reason
+			}
+			if fact.Kind == "billing" {
+				fact.UpstreamBase = subBindingSite(fact.UpstreamBase)
+			}
+			if fact.SourceID == "" {
+				fact.SourceID = e.cfg.SourceID
+				if fact.SourceID == "" {
+					fact.SourceID = "primary"
+				}
+			}
+			if err = encoder.Encode(fact); err != nil {
+				file.Close()
+				return err
+			}
+			factCount++
+		}
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	tx, err := e.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if factCount > 0 {
+		_, err = tx.ExecContext(ctx, `INSERT INTO facts BY NAME SELECT event_id,kind,source_id,instance_id,request_id,attempt_id,at_ms,started_ms,key_id,provider,model,upstream_model,endpoint,stream,outcome,status,duration_ms,dispatch_ms,first_output_ms,response_created_ms,first_text_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,actual_cost_usd,upstream_base,upstream_key_hash,billing_request_ids,upstream_error_sha256,trace_id,stage,CAST(trace_detail AS VARCHAR) AS trace_detail,CAST(transport_timing AS VARCHAR) AS transport_timing,terminal_kind,failure_reason,response_completed FROM read_json(?,format='newline_delimited',columns={schema:'INTEGER',event_id:'VARCHAR',kind:'VARCHAR',source_id:'VARCHAR',instance_id:'VARCHAR',request_id:'VARCHAR',attempt_id:'VARCHAR',at_ms:'BIGINT',started_ms:'BIGINT',key_id:'VARCHAR',provider:'VARCHAR',model:'VARCHAR',upstream_model:'VARCHAR',endpoint:'VARCHAR',stream:'BOOLEAN',outcome:'VARCHAR',status:'INTEGER',duration_ms:'DOUBLE',dispatch_ms:'DOUBLE',first_output_ms:'DOUBLE',response_created_ms:'DOUBLE',first_text_ms:'DOUBLE',input_tokens:'BIGINT',output_tokens:'BIGINT',cache_read_tokens:'BIGINT',cache_write_tokens:'BIGINT',cache_write_1h_tokens:'BIGINT',actual_cost_usd:'DOUBLE',upstream_base:'VARCHAR',upstream_key_hash:'VARCHAR',billing_request_ids:'VARCHAR[]',upstream_error_sha256:'VARCHAR',trace_id:'VARCHAR',stage:'VARCHAR',trace_detail:'JSON',transport_timing:'JSON',terminal_kind:'VARCHAR',failure_reason:'VARCHAR',response_completed:'BOOLEAN'}) ON CONFLICT DO NOTHING`, file.Name())
+		if err != nil {
+			return err
+		}
+	}
+	minutes, days := map[int64]bool{}, map[int64]bool{}
+	for _, obj := range pending {
+		for _, f := range obj.Facts {
+			minutes[f.AtMS/60000*60000] = true
+			local := time.UnixMilli(f.AtMS).In(e.Location)
+			days[time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, e.Location).UnixMilli()] = true
+		}
+	}
+	for start := 0; start < len(pending); start += 256 {
+		end := min(start+256, len(pending))
+		values := make([]string, 0, end-start)
+		args := make([]any, 0, 3*(end-start))
+		for _, obj := range pending[start:end] {
+			values = append(values, "(?,?,?)")
+			args = append(args, obj.Key, obj.ETag, len(obj.Facts))
+		}
+		if _, err = tx.ExecContext(ctx, "INSERT INTO imported_objects(object_key,etag,events) VALUES "+strings.Join(values, ","), args...); err != nil {
+			return err
+		}
+	}
+	for minute := range minutes {
+		if err = e.rebuildRollup(ctx, tx, "minute", minute, minute+60000); err != nil {
+			return err
+		}
+	}
+	for day := range days {
+		if err = e.rebuildRollup(ctx, tx, "day", day, time.UnixMilli(day).In(e.Location).AddDate(0, 0, 1).UnixMilli()); err != nil {
+			return err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	e.Revision.Add(1)
+	return nil
+}
+
+// ImportedObjectPage bounds memory to the current listing page. Source-prefixed
+// keys preserve the existing cross-source and late-arrival identity semantics.
+func (e *Engine) ImportedObjectPage(ctx context.Context, keys []string) (map[string]string, error) {
+	result := make(map[string]string, len(keys))
+	for start := 0; start < len(keys); start += 1000 {
+		end := min(start+1000, len(keys))
+		args := make([]any, 0, end-start)
+		for _, key := range keys[start:end] {
+			args = append(args, key)
+		}
+		rows, err := e.DB.QueryContext(ctx, "SELECT object_key,etag FROM imported_objects WHERE object_key IN ("+strings.TrimRight(strings.Repeat("?,", len(args)), ",")+")", args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var key, etag string
+			if err = rows.Scan(&key, &etag); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			result[key] = etag
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func histogramSQL(column string) string {
+	parts := make([]string, len(histogramBounds))
+	for i, b := range histogramBounds {
+		condition := column + " IS NOT NULL"
+		if !math.IsInf(b, 1) {
+			condition += fmt.Sprintf(" AND %s<=%g", column, b)
+		}
+		if i > 0 {
+			condition += fmt.Sprintf(" AND %s>%g", column, histogramBounds[i-1])
+		}
+		parts[i] = "count(*) FILTER (WHERE " + condition + ")"
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+func (e *Engine) rebuildRollup(ctx context.Context, tx *sql.Tx, level string, start, end int64) error {
+	if _, err := tx.ExecContext(ctx, "DELETE FROM rollups WHERE level=? AND period_ms=?", level, start); err != nil {
+		return err
+	}
+	// Only partitions receiving new data are rebuilt. Daily rows combine minute
+	// aggregates, so long windows never scan request-level records.
+	if level == "day" {
+		_, err := tx.ExecContext(ctx, `INSERT INTO rollups(period_ms,level,kind,source_id,key_id,provider,model,upstream_model,endpoint,stream,outcome,n,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,usage_samples,cache_samples,actual_cost_usd,actual_cost_samples,first_bins,dispatch_bins,first_count,dispatch_count,first_sum,dispatch_sum,last_ms,last_first,last_dispatch,created_bins,created_count,created_sum,last_created,text_bins,text_count,text_sum,last_text) SELECT ?, 'day',kind,source_id,key_id,provider,model,upstream_model,endpoint,stream,outcome,sum(n),sum(input_tokens),sum(output_tokens),sum(cache_read_tokens),sum(cache_write_tokens),sum(cache_write_1h_tokens),sum(usage_samples),sum(cache_samples),sum(actual_cost_usd),sum(actual_cost_samples),`+mergeHistogramSQL("first_bins")+`,`+mergeHistogramSQL("dispatch_bins")+`,sum(first_count),sum(dispatch_count),sum(first_sum),sum(dispatch_sum),max(last_ms),arg_max(last_first,last_ms),arg_max(last_dispatch,last_ms),`+mergeHistogramSQL("created_bins")+`,sum(created_count),sum(created_sum),arg_max(last_created,last_ms),`+mergeHistogramSQL("text_bins")+`,sum(text_count),sum(text_sum),arg_max(last_text,last_ms) FROM rollups WHERE level='minute' AND period_ms>=? AND period_ms<? GROUP BY kind,source_id,key_id,provider,model,upstream_model,endpoint,stream,outcome`, start, start, end)
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO rollups(period_ms,level,kind,source_id,key_id,provider,model,upstream_model,endpoint,stream,outcome,n,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,usage_samples,cache_samples,actual_cost_usd,actual_cost_samples,first_bins,dispatch_bins,first_count,dispatch_count,first_sum,dispatch_sum,last_ms,last_first,last_dispatch,created_bins,created_count,created_sum,last_created,text_bins,text_count,text_sum,last_text) SELECT ?, 'minute',kind,source_id,key_id,provider,model,upstream_model,endpoint,stream,outcome,count(*),sum(coalesce(input_tokens,0)),sum(coalesce(output_tokens,0)),sum(coalesce(cache_read_tokens,0)),sum(coalesce(cache_write_tokens,0)),sum(coalesce(cache_write_1h_tokens,0)),count(input_tokens),count(cache_read_tokens),sum(coalesce(actual_cost_usd,0)),count(actual_cost_usd),`+histogramSQL("first_output_ms")+`,`+histogramSQL("dispatch_ms")+`,count(first_output_ms),count(dispatch_ms),sum(coalesce(first_output_ms,0)),sum(coalesce(dispatch_ms,0)),max(at_ms),arg_max(first_output_ms,at_ms),arg_max(dispatch_ms,at_ms),`+histogramSQL("response_created_ms")+`,count(response_created_ms),sum(coalesce(response_created_ms,0)),arg_max(response_created_ms,at_ms),`+histogramSQL("first_text_ms")+`,count(first_text_ms),sum(coalesce(first_text_ms,0)),arg_max(first_text_ms,at_ms) FROM facts WHERE kind NOT IN ('billing','trace') AND at_ms>=? AND at_ms<? GROUP BY kind,source_id,key_id,provider,model,upstream_model,endpoint,stream,outcome`, start, start, end)
+	return err
+}
+func mergeHistogramSQL(column string) string {
+	parts := make([]string, len(histogramBounds))
+	for i := range parts {
+		parts[i] = fmt.Sprintf("sum(%s[%d])", column, i+1)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+func (e *Engine) Prices(ctx context.Context) ([]Price, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rows, err := e.DB.QueryContext(ctx, `SELECT model,input,output,cache_read,cache_write,cache_write_1h,source,verified,effective_at,charge_cache_write,sale_percent,long_context_premium FROM prices UNION ALL SELECT DISTINCT model,0,0,0,0,0,'fact-discovered',false,current_timestamp,NULL::BOOLEAN,NULL::DOUBLE,NULL::BOOLEAN FROM rollups WHERE model <> '' AND model NOT IN (SELECT model FROM prices) ORDER BY model`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Price{}
+	for rows.Next() {
+		var p Price
+		if err = rows.Scan(&p.Model, &p.Input, &p.Output, &p.CacheRead, &p.CacheWrite, &p.CacheWrite1h, &p.Source, &p.Verified, &p.EffectiveAt, &p.ChargeCacheWrite, &p.SalePercent, &p.LongContextPremium); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return withCatalogPrices(out), rows.Err()
+}
+
+// These are editable reference prices in USD per million tokens. They are
+// seeded once for models whose published rate is known; provider-specific or
+// synthetic model names remain unpriced until an operator confirms a value.
+var defaultPrices = func() map[string]Price {
+	// Retain prices for legacy historical models, without offering them in the
+	// detector-aligned settings list.
+	prices := map[string]Price{
+		"gpt-5.4":      {Input: 2.5, Output: 15, CacheRead: 0.25, Source: "OpenAI API model page", Verified: true},
+		"gpt-5.4-mini": {Input: 0.75, Output: 4.5, CacheRead: 0.075, Source: "OpenAI API model page", Verified: true},
+	}
+	for _, price := range modelCatalog {
+		prices[price.Model] = price
+	}
+	return prices
+}()
+
+func (e *Engine) seedDefaultPrices() error {
+	for model, price := range defaultPrices {
+		var exists bool
+		if err := e.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM prices WHERE model=?)", model).Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if _, err := e.DB.Exec("INSERT INTO prices(model,input,output,cache_read,cache_write,cache_write_1h,source,verified,effective_at) VALUES(?,?,?,?,?,?,?,?,current_timestamp)", model, price.Input, price.Output, price.CacheRead, price.CacheWrite, price.CacheWrite1h, price.Source, price.Verified); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func validatePrice(p Price) error {
+	if p.Model == "" || len(p.Model) > 512 {
+		return errors.New("model required")
+	}
+	for _, v := range []float64{p.Input, p.Output, p.CacheRead, p.CacheWrite, p.CacheWrite1h} {
+		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) || v > 1e9 {
+			return errors.New("invalid price")
+		}
+	}
+	if p.SalePercent != nil && (*p.SalePercent < 0 || *p.SalePercent > 1e6 || math.IsNaN(*p.SalePercent) || math.IsInf(*p.SalePercent, 0)) {
+		return errors.New("invalid sale percentage")
+	}
+	if len(p.Source) > 2048 {
+		return errors.New("price source too long")
+	}
+	return nil
+}
+func (e *Engine) SavePrice(ctx context.Context, p Price) error {
+	if err := validatePrice(p); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// An older client omitting the new field must not erase a saved override.
+	if p.SalePercent == nil {
+		err := e.DB.QueryRowContext(ctx, "SELECT sale_percent FROM prices WHERE model=?", p.Model).Scan(&p.SalePercent)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	if p.LongContextPremium == nil {
+		err := e.DB.QueryRowContext(ctx, "SELECT long_context_premium FROM prices WHERE model=?", p.Model).Scan(&p.LongContextPremium)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	p.EffectiveAt = time.Now().UTC()
+	raw, _ := json.Marshal(p)
+	tx, err := e.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO prices(model,input,output,cache_read,cache_write,cache_write_1h,source,verified,effective_at,charge_cache_write,sale_percent,long_context_premium) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, p.Model, p.Input, p.Output, p.CacheRead, p.CacheWrite, p.CacheWrite1h, p.Source, p.Verified, p.EffectiveAt, p.ChargeCacheWrite, p.SalePercent, p.LongContextPremium); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO price_history(model,document) VALUES(?,?)", p.Model, string(raw)); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	e.Revision.Add(1)
+	return nil
+}
+func (e *Engine) ExportParquet(ctx context.Context, destination string, start, end int64) error {
+	path, err := filepath.Abs(destination)
+	if err != nil {
+		return err
+	}
+	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	_, err = e.DB.ExecContext(ctx, fmt.Sprintf("COPY (SELECT * FROM facts WHERE at_ms >= %d AND at_ms < %d) TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD)", start, end, strings.ReplaceAll(path, "'", "''")))
+	return err
+}
